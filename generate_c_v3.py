@@ -12,8 +12,8 @@ def parse_tree(tree_text):
         if not line:
             continue
         
-        # Count TAB characters for depth (not spaces!)
-        depth = line.count('\t')
+        indent = len(line) - len(line.lstrip())
+        depth = indent // 2
         
         if 'leaf=' in line:
             match = re.search(r'leaf=([-\d.]+)', line)
@@ -84,14 +84,22 @@ classes = model['classes']
 scaler_mean = model['scaler_mean']
 scaler_std = model['scaler_std']
 model_dump = model['model_dump']
-base_score = model['base_score']
-n_trees = model['n_trees']
 
 classes_str = ', '.join([f'"{c}"' for c in classes])
 mean_str = ', '.join([f'{m:.10f}f' for m in scaler_mean])
 std_str = ', '.join([f'{s:.10f}f' for s in scaler_std])
 
-print(f"Total trees: {n_trees}, Classes: {n_classes}")
+n_trees_per_class = len(model_dump) // n_classes
+n_trees = len(model_dump)
+print(f"Total trees: {n_trees}, Classes: {n_classes}, Trees per class: {n_trees_per_class}")
+
+# Debug: Check a few tree outputs
+sample_features = [1.3315, -0.7165, 0.0, 0.7564, -1.2103, -0.2333, -0.6688, -0.4425, 
+                   -0.0254, -0.4418, 0.0340, -0.1192, 2.6490, 0.1942, -0.1100]
+
+# Get first tree output
+tree_nodes = parse_tree(model_dump[0])
+print("First tree nodes:", tree_nodes[:5])
 
 # Generate header
 header = f'''/**
@@ -109,7 +117,6 @@ header = f'''/**
 #define N_FEATURES {n_features}
 #define N_CLASSES {n_classes}
 #define N_TREES {n_trees}
-#define BASE_SCORE {base_score}f
 
 extern const char* CLASS_NAMES[{n_classes}];
 extern const float SCALER_MEAN[{n_features}];
@@ -130,7 +137,7 @@ int lim_predict_class_idx(const float* features);
 with open('lim_model.h', 'w') as f:
     f.write(header)
 
-# Generate source
+# Generate source with all trees
 source = f'''/**
  * LiM XGBoost Model - C Source
  * Network Traffic Classification Model
@@ -138,18 +145,7 @@ source = f'''/**
  * 
  * This model classifies network traffic based on packet-level features.
  * It uses XGBoost with {n_trees} trees for {n_classes} classes.
- * 
- * CORRECT MAPPING: tree[i] corresponds to class (i % n_classes)
- * - tree[0] -> class 0
- * - tree[1] -> class 1
- * - ...
- * - tree[9] -> class 9
- * - tree[10] -> class 0
- * - tree[11] -> class 1
- * 
- * Prediction formula:
- *   score[class] = BASE_SCORE + sum(tree_outputs for that class)
- *   prob[class] = softmax(score)
+ * Each class has {n_trees_per_class} trees for multi-class softmax probability.
  */
 
 #include "lim_model.h"
@@ -168,32 +164,27 @@ void lim_preprocess(const float* raw_features, float* features) {{
 
 '''
 
-# Generate tree functions
 for idx, tree_dump in enumerate(model_dump):
     nodes = parse_tree(tree_dump)
     func = nodes_to_c(nodes, f"tree_{idx}")
     source += func + "\n"
 
-# CORRECT PREDICTION: tree[i] -> class (i % n_classes)
+# Prediction function
 source += f'''void lim_predict(const float* features, LimPrediction* pred) {{
-    // Compute score for each class: BASE_SCORE + sum of its trees
-    // CORRECT MAPPING: tree[i] corresponds to class (i % n_classes)
-    float scores[N_CLASSES];
-    
-    for (int c = 0; c < N_CLASSES; c++) {{
-        scores[c] = BASE_SCORE;
-    }}
-    
-    // Sum each tree's output to its corresponding class (i % n_classes)
+    // Sum up tree outputs for each class
+    // Each class has its own set of {n_trees_per_class} trees
+    float scores[N_CLASSES] = {{0}};
 '''
 
-# Generate the sum calls for all trees
-for i in range(n_trees):
-    class_idx = i % n_classes
-    source += f"    scores[{class_idx}] += tree_{i}(features);\n"
+# For each class, sum its trees
+for class_idx in range(n_classes):
+    for tree_idx in range(n_trees_per_class):
+        global_idx = class_idx * n_trees_per_class + tree_idx
+        source += f"    scores[{class_idx}] += tree_{global_idx}(features);\n"
 
 source += '''
-    // Apply softmax for probability (numerically stable)
+    // Apply softmax for probability
+    // Subtract max for numerical stability
     float max_score = scores[0];
     for (int i = 1; i < N_CLASSES; i++) {
         if (scores[i] > max_score) {
@@ -244,4 +235,3 @@ with open('lim_model.c', 'w') as f:
     f.write(source)
 
 print(f"Generated lim_model.c with {n_trees} tree functions")
-print(f"Formula: tree[i] -> class (i % {n_classes})")

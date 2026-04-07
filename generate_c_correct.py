@@ -12,8 +12,8 @@ def parse_tree(tree_text):
         if not line:
             continue
         
-        # Count TAB characters for depth (not spaces!)
-        depth = line.count('\t')
+        indent = len(line) - len(line.lstrip())
+        depth = indent // 2
         
         if 'leaf=' in line:
             match = re.search(r'leaf=([-\d.]+)', line)
@@ -91,7 +91,8 @@ classes_str = ', '.join([f'"{c}"' for c in classes])
 mean_str = ', '.join([f'{m:.10f}f' for m in scaler_mean])
 std_str = ', '.join([f'{s:.10f}f' for s in scaler_std])
 
-print(f"Total trees: {n_trees}, Classes: {n_classes}")
+n_trees_per_class = n_trees // n_classes
+print(f"Total trees: {n_trees}, Classes: {n_classes}, Trees per class: {n_trees_per_class}")
 
 # Generate header
 header = f'''/**
@@ -109,6 +110,7 @@ header = f'''/**
 #define N_FEATURES {n_features}
 #define N_CLASSES {n_classes}
 #define N_TREES {n_trees}
+#define N_TREES_PER_CLASS {n_trees_per_class}
 #define BASE_SCORE {base_score}f
 
 extern const char* CLASS_NAMES[{n_classes}];
@@ -138,14 +140,7 @@ source = f'''/**
  * 
  * This model classifies network traffic based on packet-level features.
  * It uses XGBoost with {n_trees} trees for {n_classes} classes.
- * 
- * CORRECT MAPPING: tree[i] corresponds to class (i % n_classes)
- * - tree[0] -> class 0
- * - tree[1] -> class 1
- * - ...
- * - tree[9] -> class 9
- * - tree[10] -> class 0
- * - tree[11] -> class 1
+ * Each class has {n_trees_per_class} trees.
  * 
  * Prediction formula:
  *   score[class] = BASE_SCORE + sum(tree_outputs for that class)
@@ -174,23 +169,21 @@ for idx, tree_dump in enumerate(model_dump):
     func = nodes_to_c(nodes, f"tree_{idx}")
     source += func + "\n"
 
-# CORRECT PREDICTION: tree[i] -> class (i % n_classes)
+# Prediction function with correct formula
 source += f'''void lim_predict(const float* features, LimPrediction* pred) {{
     // Compute score for each class: BASE_SCORE + sum of its trees
-    // CORRECT MAPPING: tree[i] corresponds to class (i % n_classes)
     float scores[N_CLASSES];
     
     for (int c = 0; c < N_CLASSES; c++) {{
         scores[c] = BASE_SCORE;
     }}
-    
-    // Sum each tree's output to its corresponding class (i % n_classes)
 '''
 
-# Generate the sum calls for all trees
-for i in range(n_trees):
-    class_idx = i % n_classes
-    source += f"    scores[{class_idx}] += tree_{i}(features);\n"
+# Sum tree outputs for each class
+for class_idx in range(n_classes):
+    for tree_idx in range(n_trees_per_class):
+        tree_global = class_idx * n_trees_per_class + tree_idx
+        source += f"    scores[{class_idx}] += tree_{tree_global}(features);\n"
 
 source += '''
     // Apply softmax for probability (numerically stable)
@@ -244,4 +237,4 @@ with open('lim_model.c', 'w') as f:
     f.write(source)
 
 print(f"Generated lim_model.c with {n_trees} tree functions")
-print(f"Formula: tree[i] -> class (i % {n_classes})")
+print(f"Formula: score[class] = BASE_SCORE(0.5) + sum(tree_outputs for class)")
